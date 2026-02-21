@@ -1,0 +1,293 @@
+# =============================================================================
+# PERSISTENT RDP SERVICE - NO CRASH, NO WINGET
+# =============================================================================
+name: Persistent-RDP-Service
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [respawn-rdp]
+
+jobs:
+  immortal-rdp:
+    runs-on: windows-2025
+
+    steps:
+      - name: Ownership Verification (Encoded)
+        run: |
+          $encodedNotice = "Cj09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQogQ29weXJpZ2h0IMKpIDIwMjUgVG9vbGJveExhcC54eXogfCBodHRwczovL3d3dy50b29sYm94bGFwLnh5ei8KIEFsbCByaWdodHMgcmVzZXJ2ZWQuIERvIG5vdCByZW1vdmUgb3IgbW9kaWZ5IGNvcHlyaWdodCB0ZXh0LgogWW91VHViZTogaHR0cHM6Ly93d3cueW91dHViZS5jb20vY2hhbm5lbC9VQ0RUNGZzOUp3cm5RSVhQclhYOHlIZVEKIEZhY2Vib29rOiBodHRwczovL3d3dy5mYWNlYm9vay5jb20vcHJvZmlsZS5waHA/aWQ9NjE1Njc4OTY2OTI5OTQKIEFueSBjaGFuZ2VzIHdpbGwgYXV0b21hdGljYWxseSBkaXNhYmxlIHRoaXMgc2NyaXB0IQo9PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0K"
+          $decodedNotice = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encodedNotice))
+          Write-Host $decodedNotice
+          if (-not $decodedNotice -or $decodedNotice -notlike "*ToolboxLap.xyz*") {
+              Write-Error "Copyright was tampered with or removed – script will not work!"
+              exit 1
+          }
+
+      # ========== FIX: Install GitHub CLI Silently (No Winget) ==========
+      - name: Install GitHub CLI Silently (No Winget)
+        run: |
+          Write-Host "Downloading GitHub CLI MSI..."
+          $msiUrl = "https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_windows_amd64.msi"
+          $msiPath = "$env:TEMP\gh.msi"
+          
+          # Download installer
+          Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath
+          
+          Write-Host "Installing GitHub CLI silently..."
+          # Install with no windows or questions
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$msiPath`"", "/quiet", "/norestart", "/qn" -Wait
+          
+          # Delete installer after installation
+          Remove-Item $msiPath -Force
+          
+          # Add to PATH (to be sure)
+          $ghPath = [Environment]::GetFolderPath("ProgramFiles") + "\GitHub CLI"
+          if (Test-Path $ghPath) {
+              echo $ghPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+              Write-Host "GitHub CLI installed successfully!"
+          } else {
+              Write-Host "Trying alternate path..."
+              $altPath = "${env:ProgramFiles(x86)}\GitHub CLI"
+              if (Test-Path $altPath) {
+                  echo $altPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+                  Write-Host "GitHub CLI installed successfully (x86)!"
+              } else {
+                  Write-Error "GitHub CLI installation failed!"
+                  exit 1
+              }
+          }
+          
+          # Verify installation
+          gh --version
+
+      - name: Core RDP Settings
+        run: |
+          $folderPath = "D:\link subscribe youtube channel"
+          if (-Not (Test-Path -Path $folderPath)) { 
+              New-Item -Path $folderPath -ItemType Directory -Force
+              Write-Host "Folder created: $folderPath"
+          } else {
+              Write-Host "Folder already exists: $folderPath"
+          }
+
+      - name: Configure Core RDP Settings
+        run: |
+          Write-Host "Enabling RDP..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          
+          Write-Host "Configuring firewall..."
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          
+          Write-Host "Restarting Terminal Services..."
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured successfully!"
+
+      - name: Create RDP User with Static Password
+        run: |
+          $password = "admin@123"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $username = "TOOLBOXLAP"
+          
+          # Check if user exists
+          $userExists = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          
+          if (-not $userExists) {
+              Write-Host "Creating user $username..."
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+              Write-Host "User created successfully!"
+          } else {
+              Write-Host "User $username already exists, skipping creation."
+          }
+          
+          # Add user to groups (ignore errors if already member)
+          Write-Host "Adding user to Administrators group..."
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          
+          Write-Host "Adding user to Remote Desktop Users group..."
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          
+          Write-Host "User setup completed."
+          
+          # Save credentials for later steps
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          Write-Host "Downloading Tailscale installer..."
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Write-Host "Download complete."
+          
+          Write-Host "Installing Tailscale silently..."
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "/qn" -Wait
+          
+          Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed successfully!"
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Find Tailscale executable path
+          $tsPaths = @(
+              "$env:ProgramFiles\Tailscale\tailscale.exe",
+              "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe",
+              "$env:LOCALAPPDATA\Tailscale\tailscale.exe"
+          )
+          
+          $tsExe = $null
+          foreach ($path in $tsPaths) {
+              if (Test-Path $path) {
+                  $tsExe = $path
+                  break
+              }
+          }
+          
+          if (-not $tsExe) {
+              Write-Error "Tailscale executable not found!"
+              exit 1
+          }
+          
+          Write-Host "Using Tailscale at: $tsExe"
+          
+          # Connect to Tailscale
+          Write-Host "Connecting to Tailscale network..."
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Get Tailscale IP
+          Write-Host "Waiting for Tailscale IP assignment..."
+          $tsIP = $null
+          $retries = 0
+          $maxRetries = 20
+          
+          while (-not $tsIP -and $retries -lt $maxRetries) {
+              $tsIP = & $tsExe ip -4 2>$null
+              if ($tsIP) {
+                  Write-Host "Tailscale IP assigned: $tsIP"
+              } else {
+                  Write-Host "Waiting for IP... ($retries/$maxRetries)"
+                  Start-Sleep -Seconds 5
+                  $retries++
+              }
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Failed to get Tailscale IP after $maxRetries attempts"
+              exit 1
+          }
+          
+          # Save IP to environment
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Verifying RDP access on Tailscale IP: $env:TAILSCALE_IP"
+          
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          
+          if ($testResult.TcpTestSucceeded) {
+              Write-Host "✓ RDP port 3389 is accessible!"
+          } else {
+              Write-Warning "RDP port test failed. This might be normal if firewall is still configuring."
+              Write-Host "Will continue anyway as Tailscale tunnel might still work."
+          }
+
+      - name: Broadcast Connection Details to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          Write-Host "Preparing connection details message..."
+          
+          $message = @"
+          🚀 **New Persistent RDP Instance Spawned**
+          - **Tailscale IP:** $env:TAILSCALE_IP
+          - **Username:** TOOLBOXLAP
+          - **Password:** admin@123
+          - **Runner ID:** $env:GITHUB_RUN_ID
+          - **Repository:** $env:GITHUB_REPOSITORY
+          
+          Connect via Remote Desktop Client using the Tailscale IP.
+          "@
+          
+          Write-Host "Sending to Telegram..."
+          
+          $telegramUrl = "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/sendMessage"
+          $body = @{
+              chat_id = $env:TELEGRAM_CHAT_ID
+              text = $message
+              parse_mode = "Markdown"
+          } | ConvertTo-Json
+          
+          try {
+              $response = Invoke-RestMethod -Uri $telegramUrl -Method Post -ContentType "application/json" -Body $body
+              if ($response.ok) {
+                  Write-Host "✓ Message sent successfully to Telegram"
+              } else {
+                  Write-Warning "Telegram send failed but continuing..."
+              }
+          } catch {
+              Write-Warning "Failed to send Telegram message: $_"
+          }
+
+      - name: Maintain Connection & Auto-Respawn
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = "$env:GITHUB_REPOSITORY"
+          $workflow_id = "Persistent-RDP-Service.yml"
+          
+          # For free GitHub accounts: max is 360 minutes (6 hours)
+          # Set to 300 minutes to be safe (5 hours before forced termination)
+          $maxJobMinutes = 300
+          $checkIntervalSeconds = 60
+          $startTime = Get-Date
+          
+          Write-Host "========================================="
+          Write-Host "🚀 RDP SERVER IS NOW ACTIVE"
+          Write-Host "========================================="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: TOOLBOXLAP"
+          Write-Host "Password: admin@123"
+          Write-Host "Powered by ToolboxLap.xyz"
+          Write-Host "========================================="
+          Write-Host ""
+          Write-Host "This server will auto-respawn every ~$maxJobMinutes minutes"
+          Write-Host "Check Telegram for new IP after respawn"
+          Write-Host ""
+          
+          # Infinite loop to keep the job alive and monitor time
+          while ($true) {
+              $elapsed = (Get-Date) - $startTime
+              $elapsedMinutes = [math]::Round($elapsed.TotalMinutes, 2)
+              $remainingMinutes = $maxJobMinutes - $elapsedMinutes
+              
+              Write-Host "[$(Get-Date)] Uptime: $elapsedMinutes min | Remaining: $([math]::Round($remainingMinutes, 2)) min"
+              
+              # Check if it's time to respawn
+              if ($elapsedMinutes -ge $maxJobMinutes) {
+                  Write-Host ""
+                  Write-Host "🔄 MAXIMUM UPTIME REACHED - TRIGGERING SUCCESSOR INSTANCE"
+                  Write-Host ""
+                  
+                  # Trigger the workflow again
+                  gh workflow run $workflow_id --repo $repo
+                  
+                  if ($LASTEXITCODE -eq 0) {
+                      Write-Host "✓ Successor workflow triggered successfully!"
+                      Write-Host "This instance will now terminate in 30 seconds."
+                      Start-Sleep -Seconds 30
+                      exit 0
+                  } else {
+                      Write-Host "✗ Failed to trigger successor workflow. Will retry in 5 minutes..."
+                      # Reset timer to give some time before retry
+                      $startTime = (Get-Date).AddMinutes(-($maxJobMinutes - 5))
+                  }
+              }
+              
+              Start-Sleep -Seconds $checkIntervalSeconds
+          }
